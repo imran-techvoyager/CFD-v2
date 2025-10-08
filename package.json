@@ -1,5 +1,5 @@
 {
-  "name": "CFD-V2",
+  "name": "cfd-v2",
   "private": true,
   "scripts": {
     "build": "turbo run build",
