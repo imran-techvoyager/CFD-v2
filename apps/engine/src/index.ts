@@ -19,7 +19,7 @@ export const ORDER: Record<
 > = {};
 
 async function engine(){
-
+    await redis.connect();
 }
 
 engine();
