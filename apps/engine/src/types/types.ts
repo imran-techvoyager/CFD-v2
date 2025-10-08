@@ -1,0 +1,1 @@
+export type CloseOrderReason = "take_profit" | "stop_loss" | "liquidation" | "manual";
