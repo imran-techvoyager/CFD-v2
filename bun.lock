@@ -11,6 +11,9 @@
     },
     "apps/engine": {
       "name": "engine",
+      "dependencies": {
+        "@repo/db": "workspace:*",
+      },
       "devDependencies": {
         "@types/bun": "latest",
       },
