@@ -46,6 +46,7 @@
     "apps/websocket_server": {
       "name": "websocket_server",
       "dependencies": {
+        "@repo/redis": "workspace:*",
         "@types/ws": "^8.18.1",
         "ws": "^8.18.3",
       },

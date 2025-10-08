@@ -10,6 +10,7 @@
     "typescript": "^5"
   },
   "dependencies": {
+    "@repo/redis": "workspace:*",
     "@types/ws": "^8.18.1",
     "ws": "^8.18.3"
   }
