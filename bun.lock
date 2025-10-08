@@ -13,6 +13,7 @@
       "name": "engine",
       "dependencies": {
         "@repo/db": "workspace:*",
+        "@repo/redis": "workspace:*",
       },
       "devDependencies": {
         "@types/bun": "latest",

@@ -1,3 +1,5 @@
+import { redis } from "@repo/redis/client";
+
 export const PRICESTORE: Record<string, { ask: number; bid: number }> = {};
 
 export const ORDER: Record<
@@ -15,3 +17,9 @@ export const ORDER: Record<
     liquidation?: number;
   }
 > = {};
+
+async function engine(){
+
+}
+
+engine();
