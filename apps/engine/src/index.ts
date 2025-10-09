@@ -2,6 +2,7 @@ import { redis } from "@repo/redis/client";
 import prismaClient from "@repo/db/client";
 import { checkOpenOrders } from "./service/checkOrders";
 import { closeOrder as serviceCloseOrder } from "./service/closeOrder";
+import { createSnapshot } from "./service/snapshot";
 
 export const PRICESTORE: Record<string, { ask: number; bid: number }> = {};
 export const ORDER: Record<
@@ -297,10 +298,34 @@ async function engineLoop() {
   }
 }
 
+async function restoreLastSnapshot() {
+  try {
+    const latest = await prismaClient.engineSnapshot.findFirst({
+      orderBy: { timestamp: "desc" },
+    });
+
+    if (!latest) {
+      console.log("[SNAPSHOT] No snapshot found, starting fresh.");
+      return;
+    }
+
+    Object.assign(ORDER, latest.openOrders || {});
+    Object.assign(PRICESTORE, latest.priceStore || {});
+
+    console.log(`[SNAPSHOT] Restored engine state from ${latest.timestamp}`);
+  } catch (e) {
+    console.error("[SNAPSHOT RESTORE ERROR]", e);
+  }
+}
+
 async function start() {
   // connect both clients
   await reader.connect();
   await publisher.connect();
+
+  await restoreLastSnapshot();
+
+  setInterval(createSnapshot, 10_000);
 
   console.log("Engine connected to Redis - starting loop");
   await engineLoop();
