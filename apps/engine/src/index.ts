@@ -3,6 +3,7 @@ import prismaClient from "@repo/db/client";
 import { checkOpenOrders } from "./service/checkOrders";
 import { closeOrder as serviceCloseOrder } from "./service/closeOrder";
 import { createSnapshot } from "./service/snapshot";
+import { getLastStreamId, setLastStreamId } from "./service/streamState";
 
 export const PRICESTORE: Record<string, { ask: number; bid: number }> = {};
 export const ORDER: Record<
@@ -255,45 +256,69 @@ async function handleMessage(kind: string | undefined, payload: any) {
  * Main loop: continuously XREAD BLOCK 0 engine-stream lastId
  * Keeps lastId so we don't reprocess.
  */
-async function engineLoop() {
-  // start from "$" so only new messages are read
-  let lastId = "$";
+async function replayMissedMessages(lastStreamId: string) {
+  console.log(`[ENGINE] Replaying missed messages since stream ID: ${lastStreamId}`);
 
-  // reconnect loop
+  let replayId = lastStreamId;
+
+  while (true) {
+    const res = await reader.xread("COUNT", 100, "STREAMS", "engine-stream", replayId);
+    if (!res || !res.length) break;
+
+    let processed = 0;
+
+    for (const [, messages] of res) {
+      for (const [id, fields] of messages as [string, string[]][]) {
+        const { kind, payload } = parseFields(fields);
+        await handleMessage(kind, payload);
+        setLastStreamId(id);
+        replayId = id;
+        processed++;
+      }
+    }
+
+    if (processed === 0) break;
+  }
+
+  console.log("[ENGINE] Replay completed — switching to live mode.");
+}
+
+export async function engineLoop() {
+  await reader.connect();
+
+  // Step 1: Load last snapshot to get lastStreamId
+  const lastSnapshot = await prismaClient.engineSnapshot.findFirst({
+    orderBy: { timestamp: "desc" },
+  });
+
+  let startFromId = "$";
+
+  if (lastSnapshot?.lastStreamId) {
+    startFromId = lastSnapshot.lastStreamId;
+    await replayMissedMessages(startFromId);
+  }
+
+  // Step 2: Enter live mode
+  console.log("[ENGINE] Live mode started...");
+
   while (true) {
     try {
-      // xread will block until a message arrives
-      const res = await reader.xread(
-        "BLOCK",
-        0,
-        "STREAMS",
-        "engine-stream",
-        lastId
-      );
-
+      const res = await reader.xread("BLOCK", 0, "STREAMS", "engine-stream", getLastStreamId());
       if (!res || !res.length) continue;
 
-      // xread returns an array of [streamKey, [[id, [field, value, ...]], ...]]
       for (const [, messages] of res) {
         for (const [id, fields] of messages as [string, string[]][]) {
-          lastId = id;
-
           const { kind, payload } = parseFields(fields);
-
-          // process sequentially to maintain order. If you want parallel processing,
-          // you can push to a worker pool here — but preserving order for price->trade is important.
           await handleMessage(kind, payload);
+          setLastStreamId(id);
         }
       }
     } catch (err) {
-      console.error("engine loop error, reconnecting in 1s", err);
+      console.error("[ENGINE] Loop error, reconnecting in 1s", err);
       await new Promise((r) => setTimeout(r, 1000));
       try {
         if (reader.status !== "ready") await reader.connect();
-        if (publisher.status !== "ready") await publisher.connect();
-      } catch (e) {
-        // swallow reconnect errors and loop
-      }
+      } catch {}
     }
   }
 }

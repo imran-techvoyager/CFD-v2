@@ -1,12 +1,16 @@
 import prismaClient from "@repo/db/client";
 import { ORDER, PRICESTORE } from "..";
+import { getLastStreamId } from "./streamState";
 
 export async function createSnapshot() {
   try {
+    const lastStreamId = getLastStreamId();
+
     await prismaClient.engineSnapshot.create({
       data: {
         openOrders: ORDER,
         priceStore: PRICESTORE,
+        lastStreamId,
       },
     });
 
