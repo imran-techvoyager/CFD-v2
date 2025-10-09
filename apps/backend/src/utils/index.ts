@@ -27,6 +27,7 @@ export async function waitForMessage(orderId: string, timeoutMs = 5000) {
         const data = JSON.parse(payloadObj.payload || "{}");
 
         if (data.id === orderId) {
+          await redis.xtrim("callback-queue", "MAXLEN", "~", 1000);
           return data; // found the matching message!
         }
 

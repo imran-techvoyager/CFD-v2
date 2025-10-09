@@ -12,7 +12,7 @@ const pubClient = redis.duplicate();
 
 async function main(){
     await pubClient.connect();
-    await redis.connect();
+    if (redis.status !== "ready") await redis.connect();
     console.log('connected to redis!');
 
     const ws = new WebSocket("wss://stream.binance.com:9443/ws");
@@ -74,5 +74,29 @@ async function main(){
         console.log('websocket connection closed');
     });
 }
+
+process.on("SIGINT", async () => {
+  console.log("SIGINT received: closing Redis connections...");
+  try {
+    await pubClient.quit();
+    await redis.quit();
+  } catch (e) {
+    console.error("Error while closing redis:", e);
+  } finally {
+    process.exit(0);
+  }
+});
+
+process.on("SIGTERM", async () => {
+  console.log("SIGTERM received: closing Redis connections...");
+  try {
+    await pubClient.quit();
+    await redis.quit();
+  } catch (e) {
+    console.error("Error while closing redis:", e);
+  } finally {
+    process.exit(0);
+  }
+});
 
 main();

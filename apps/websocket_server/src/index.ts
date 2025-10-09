@@ -45,4 +45,23 @@ async function start() {
   });
 }
 
+process.on("SIGINT", async () => {
+  console.log("SIGINT received: closing Redis connections...");
+  try {
+    await subClient.quit();
+    await redis.quit();
+  } catch (e) {}
+  process.exit(0);
+});
+
+process.on("SIGTERM", async () => {
+  console.log("SIGTERM received: closing Redis connections...");
+  try {
+    await subClient.quit();
+    await redis.quit();
+  } catch (e) {}
+  process.exit(0);
+});
+
+
 start().catch(console.error);

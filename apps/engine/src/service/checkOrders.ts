@@ -10,12 +10,12 @@ export async function checkOpenOrders(asset: string, newPrice: {ask: number, bid
          const { userId } = order;
 
          if(order.takeProfit){
-            if(order.type === "buy" && newPrice.bid <= order.takeProfit){
-                closeOrder(userId, orderId, "take_profit", newPrice.ask);
+            if(order.type === "buy" && newPrice.bid >= order.takeProfit){
+                closeOrder(userId, orderId, "take_profit", newPrice.bid);
                 continue;
             }
 
-            if(order.type === "sell" && newPrice.ask >= order.takeProfit){
+            if(order.type === "sell" && newPrice.ask <= order.takeProfit){
                 closeOrder(userId, orderId, "take_profit", newPrice.ask);
                 continue;
             }
@@ -23,7 +23,7 @@ export async function checkOpenOrders(asset: string, newPrice: {ask: number, bid
 
          if(order.stopLoss){
             if(order.type === "buy" && newPrice.bid <= order.stopLoss){
-                closeOrder(userId, orderId, "stop_loss", newPrice.ask);
+                closeOrder(userId, orderId, "stop_loss", newPrice.bid);
                 continue;
             }
 
@@ -35,7 +35,7 @@ export async function checkOpenOrders(asset: string, newPrice: {ask: number, bid
 
          if(order.liquidation){
             if(order.type === "buy" && newPrice.bid <= order.liquidation){
-                closeOrder(userId, orderId, "liquidation", newPrice.ask);
+                closeOrder(userId, orderId, "liquidation", newPrice.bid);
                 continue;
             }
 
