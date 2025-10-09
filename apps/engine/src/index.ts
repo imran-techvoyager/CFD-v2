@@ -257,12 +257,20 @@ async function handleMessage(kind: string | undefined, payload: any) {
  * Keeps lastId so we don't reprocess.
  */
 async function replayMissedMessages(lastStreamId: string) {
-  console.log(`[ENGINE] Replaying missed messages since stream ID: ${lastStreamId}`);
+  console.log(
+    `[ENGINE] Replaying missed messages since stream ID: ${lastStreamId}`
+  );
 
   let replayId = lastStreamId;
 
   while (true) {
-    const res = await reader.xread("COUNT", 100, "STREAMS", "engine-stream", replayId);
+    const res = await reader.xread(
+      "COUNT",
+      100,
+      "STREAMS",
+      "engine-stream",
+      replayId
+    );
     if (!res || !res.length) break;
 
     let processed = 0;
@@ -284,7 +292,9 @@ async function replayMissedMessages(lastStreamId: string) {
 }
 
 export async function engineLoop() {
-  await reader.connect();
+  if (reader.status !== "ready" && reader.status !== "connecting") {
+    await reader.connect();
+  }
 
   // Step 1: Load last snapshot to get lastStreamId
   const lastSnapshot = await prismaClient.engineSnapshot.findFirst({
@@ -303,7 +313,13 @@ export async function engineLoop() {
 
   while (true) {
     try {
-      const res = await reader.xread("BLOCK", 0, "STREAMS", "engine-stream", getLastStreamId());
+      const res = await reader.xread(
+        "BLOCK",
+        0,
+        "STREAMS",
+        "engine-stream",
+        getLastStreamId()
+      );
       if (!res || !res.length) continue;
 
       for (const [, messages] of res) {
@@ -317,7 +333,9 @@ export async function engineLoop() {
       console.error("[ENGINE] Loop error, reconnecting in 1s", err);
       await new Promise((r) => setTimeout(r, 1000));
       try {
-        if (reader.status !== "ready") await reader.connect();
+        if (reader.status !== "ready" && reader.status !== "connecting") {
+          await reader.connect();
+        }
       } catch {}
     }
   }
@@ -345,8 +363,12 @@ async function restoreLastSnapshot() {
 
 async function start() {
   // connect both clients
-  await reader.connect();
-  await publisher.connect();
+  if (reader.status !== "ready" && reader.status !== "connecting") {
+    await reader.connect();
+  }
+  if (publisher.status !== "ready" && publisher.status !== "connecting") {
+    await publisher.connect();
+  }
 
   await restoreLastSnapshot();
 

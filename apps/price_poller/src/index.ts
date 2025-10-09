@@ -11,9 +11,12 @@ const symbolMap: Record<string, string> = {
 const pubClient = redis.duplicate();
 
 async function main(){
+     if (pubClient.status !== "ready" && pubClient.status !== "connecting") {
     await pubClient.connect();
-    if (redis.status !== "ready") await redis.connect();
-    console.log('connected to redis!');
+    console.log("connected to Redis!");
+  } else {
+    console.log(`Redis already ${pubClient.status}`);
+  }
 
     const ws = new WebSocket("wss://stream.binance.com:9443/ws");
 
