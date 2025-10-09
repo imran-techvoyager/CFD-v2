@@ -3,6 +3,7 @@ import { redis } from "@repo/redis/client";
 import { v4 as uuidv4 } from "uuid";
 import prismaClient from "@repo/db/client";
 import { tradeSchema } from "../types/types";
+import { waitForMessage } from "../utils";
 
 export async function placeTrade(req: Request, res: Response) {
   try {
@@ -54,9 +55,22 @@ export async function placeTrade(req: Request, res: Response) {
 
     console.log("Sent to engine-stream:", orderId);
 
+    const response = await waitForMessage(orderId, 7000);
+
     return res.status(200).json({
-      msg: "trade request sent to engine",
-      orderId,
+      msg: "trade opened successfully",
+      order: {
+        orderId,
+        asset: response.asset,
+        side: response.side,
+        status: response.status,
+        openPrice: response.openPrice,
+        takeProfit: response.takeProfit,
+        stopLoss: response.stopLoss,
+        liquidation: response.liquidation,
+        leverage: response.leverage,
+        margin: response.margin,
+      },
     });
   } catch (error) {
     console.error("Error while creating trade:", error);

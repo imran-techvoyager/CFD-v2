@@ -1,4 +1,3 @@
-
 import { redis } from "@repo/redis/client";
 import prismaClient from "@repo/db/client";
 import { checkOpenOrders } from "./service/checkOrders";
@@ -94,13 +93,13 @@ async function handlePriceUpdate(payload: any) {
   // Update PRICESTORE using the symbol as provided
   PRICESTORE[symbol] = { ask, bid };
 
-//   // If you also want short symbol like BTC, derive it if possible
-//   // e.g., if symbol === "BTCUSDT" create shortSymbol = "BTC"
-//   let shortSymbol: string | undefined;
-//   const m = symbol.match(/^([A-Z]+)USDT$/);
-//   if (m) shortSymbol = m[1];
+  //   // If you also want short symbol like BTC, derive it if possible
+  //   // e.g., if symbol === "BTCUSDT" create shortSymbol = "BTC"
+  //   let shortSymbol: string | undefined;
+  //   const m = symbol.match(/^([A-Z]+)USDT$/);
+  //   if (m) shortSymbol = m[1];
 
-//   if (shortSymbol) PRICESTORE[shortSymbol] = { ask, bid };
+  //   if (shortSymbol) PRICESTORE[shortSymbol] = { ask, bid };
 
   // Check open orders for this asset (both symbol keys)
   try {
@@ -158,30 +157,17 @@ async function handlePlaceTrade(payload: any) {
     liquidation: payload.liquidation,
   };
 
-    try {
-    await prismaClient.order.create({
-      data: {
-        id: orderId,
-        userId,
-        side: type,
-        qty: margin, // adapt to your schema if qty differs from margin
-        openingPrice: openPrice,
-        status: "open",
-        leverage: Number(leverage ?? 1),
-        takeProfit: takeProfit ?? null,
-        stopLoss: stopLoss ?? null,
-        createdAt: new Date(Number(timestamp ?? Date.now())),
-      } as any,
-    });
-  } catch (e) {
-    // DB errors shouldn't block the in-memory flow, but log
-    console.error("error persisting order to DB:", e);
-  }
-
   await publishCallback({
     id: orderId,
     status: "trade_opened",
-    price: String(openPrice),
+    openPrice: String(openPrice),
+    takeProfit,
+    stopLoss,
+    liquidation: payload.liquidation ?? null,
+    leverage,
+    margin,
+    asset,
+    side: type,
   });
 }
 
@@ -218,7 +204,12 @@ async function handleCloseTrade(payload: any) {
   const closePrice = order.type === "buy" ? price.bid : price.ask;
 
   try {
-    const pnl = await serviceCloseOrder(userId ?? order.userId, orderId, "manual", closePrice);
+    const pnl = await serviceCloseOrder(
+      userId ?? order.userId,
+      orderId,
+      "manual",
+      closePrice
+    );
 
     await publishCallback({
       id: orderId,
@@ -271,7 +262,13 @@ async function engineLoop() {
   while (true) {
     try {
       // xread will block until a message arrives
-      const res = await reader.xread("BLOCK", 0, "STREAMS", "engine-stream", lastId);
+      const res = await reader.xread(
+        "BLOCK",
+        0,
+        "STREAMS",
+        "engine-stream",
+        lastId
+      );
 
       if (!res || !res.length) continue;
 
