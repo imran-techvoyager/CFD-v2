@@ -4,7 +4,7 @@ import bcrypt from 'bcrypt';
 import { authSchema, type FinalSchema } from "../types/types";
 import prismaClient from "@repo/db/client";
 import { jwtPassword } from "../config";
-import { toInternalUsd } from "../utils";
+import { toInternalUsd } from "../utils/utils";
 
 export async function signupController(req: Request, res: Response){
 
