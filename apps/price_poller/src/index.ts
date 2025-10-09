@@ -48,7 +48,7 @@ async function main(){
             if(!symbol) return;
 
             const data = {
-                  symbol: message.s,
+                  symbol: symbol,
                   askPrice: ask,
                   bidPrice: bid,
                   decimal: 4,

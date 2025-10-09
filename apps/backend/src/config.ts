@@ -1,0 +1,1 @@
+export const jwtPassword = process.env.JWT_PASSWORD;
