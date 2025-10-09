@@ -64,4 +64,5 @@ model EngineSnapshot {
   timestamp    DateTime @default(now())
   openOrders   Json
   priceStore   Json
+  lastStreamId String?
 }
