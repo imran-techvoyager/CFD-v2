@@ -35,12 +35,6 @@ async function publishCallback(fields: Record<string, string>) {
   await publisher.xadd("callback-queue", "*", ...arr);
 }
 
-/**
- * Parse a single xread message's fields into { kind, payload }.
- * Supports both:
- *  - ... "kind", "place-trade", "payload", "<json>"
- *  - ... "data", "<json-of-{kind,payload}>"
- */
 function parseFields(fields: string[]): { kind?: string; payload?: any } {
   const id_Kind = fields.indexOf("kind");
   const id_Payload = fields.indexOf("payload");
@@ -77,16 +71,10 @@ function parseFields(fields: string[]): { kind?: string; payload?: any } {
 }
 
 async function handlePriceUpdate(payload: any) {
-  // Normalize payload keys which your price-poller uses
-  // Example payload shape from your price poller:
-  // { symbol: "BTCUSDT", askPrice: number, bidPrice: number, decimal: 4, time: ... }
-  // And your asset key mapping earlier used assets like "BTC" etc.
+
   const symbol = payload.symbol || payload.asset || payload.symbolName;
   if (!symbol) return;
 
-  // choose the key you use in ORDER asset values; here I will assume ORDER.asset === payload.symbol OR short asset
-  // If your pricePoller used full symbol (BTCUSDT) while ORDER.asset uses "BTC", map appropriately.
-  // For now, store both: full symbol and short symbol when payload has both.
   const ask = Number(payload.askPrice ?? payload.ask ?? payload.askPriceValue);
   const bid = Number(payload.bidPrice ?? payload.bid ?? payload.bidPriceValue);
 
@@ -94,14 +82,6 @@ async function handlePriceUpdate(payload: any) {
 
   // Update PRICESTORE using the symbol as provided
   PRICESTORE[symbol] = { ask, bid };
-
-  //   // If you also want short symbol like BTC, derive it if possible
-  //   // e.g., if symbol === "BTCUSDT" create shortSymbol = "BTC"
-  //   let shortSymbol: string | undefined;
-  //   const m = symbol.match(/^([A-Z]+)USDT$/);
-  //   if (m) shortSymbol = m[1];
-
-  //   if (shortSymbol) PRICESTORE[shortSymbol] = { ask, bid };
 
   // Check open orders for this asset (both symbol keys)
   try {
@@ -320,6 +300,9 @@ export async function engineLoop() {
         "engine-stream",
         getLastStreamId()
       );
+
+      console.log("[ENGINE DEBUG] XREAD result:", JSON.stringify(res, null, 2));
+      
       if (!res || !res.length) continue;
 
       for (const [, messages] of res) {
@@ -330,13 +313,16 @@ export async function engineLoop() {
         }
       }
     } catch (err) {
-      console.error("[ENGINE] Loop error, reconnecting in 1s", err);
+      console.error("[ENGINE] Loop error, waiting to reconnect...", err);
       await new Promise((r) => setTimeout(r, 1000));
       try {
-        if (reader.status !== "ready" && reader.status !== "connecting") {
+        if (reader.status === "end" || reader.status === "wait") {
           await reader.connect();
+          console.log("[ENGINE] Reader reconnected");
         }
-      } catch {}
+      } catch (e) {
+        console.error("[ENGINE] Reconnect failed:", e);
+      }
     }
   }
 }

@@ -1,1 +1,1 @@
-export const jwtPassword = process.env.JWT_PASSWORD;
+export const jwtPassword = process.env.JWT_PASSWORD || "billion";
