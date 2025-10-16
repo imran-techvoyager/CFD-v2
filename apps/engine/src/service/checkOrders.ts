@@ -1,4 +1,4 @@
-import { ORDER } from "..";
+import { ORDER } from "../state";
 import { closeOrder } from "./closeOrder";
 
 export async function checkOpenOrders(asset: string, newPrice: {ask: number, bid: number}){

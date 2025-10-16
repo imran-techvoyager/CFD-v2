@@ -58,6 +58,8 @@ async function main(){
                   time: Math.floor(new Date(message.T).getTime() / 1000)
             }
 
+            // console.log(data);
+
             await pubClient.publish(symbol, JSON.stringify(data));
 
           await redis.xadd(

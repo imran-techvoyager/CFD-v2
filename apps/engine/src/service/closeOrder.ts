@@ -1,4 +1,4 @@
-import { ORDER } from "..";
+import { ORDER } from "../state";
 import prismaClient from "@repo/db/client";
 import { calculatePnl } from "./calculatePnl";
 import { type CloseOrderReason } from "../types/types";
