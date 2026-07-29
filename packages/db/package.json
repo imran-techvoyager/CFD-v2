@@ -4,17 +4,16 @@
   "type": "module",
   "private": true,
   "scripts": {
-    "db:migrate": "bunx prisma migrate dev",
-    "db:generate": "bunx prisma generate"
+    "db:migrate": "prisma migrate dev",
+    "db:deploy": "prisma migrate deploy",
+    "db:generate": "prisma generate"
   },
   "exports": {
     "./client": "./index.ts"
   },
   "devDependencies": {
-    "@types/bun": "latest"
-  },
-  "peerDependencies": {
-    "typescript": "^5"
+    "@types/node": "^22.15.3",
+    "typescript": "5.9.2"
   },
   "dependencies": {
     "@prisma/client": "^6.16.3",
