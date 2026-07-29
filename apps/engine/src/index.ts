@@ -1,228 +1,277 @@
-import { redis } from "@repo/redis/client";
+import { redis, createRedis } from "@repo/redis/client";
+import {
+  COMMAND_TTL_MS,
+  STREAMS,
+  compareStreamIds,
+  engineStreamMessageSchema,
+  type EngineCommand,
+} from "@repo/shared";
 import { checkOpenOrders } from "./service/checkOrders";
-import { closeOrder } from "./service/closeOrder";
+import { closeOrder, partialCloseOrder } from "./service/closeOrder";
+import { modifyOrder } from "./service/modifyOrder";
+import { openOrder } from "./service/openOrder";
 import { ORDER, PRICESTORE } from "./state";
-import type { CloseOrderReason } from "./types/types";
-import prismaClient from "@repo/db/client";
-import { saveSnapshot } from "./service/snapshots";
+import { saveSnapshot, restoreState } from "./service/snapshots";
 
-/**
- * Helper: Send callback response back to backend
- */
+const STREAM_MAXLEN = 100_000;
 
 let CURRENT_STREAM_ID = "$";
-let subRedis: any = null;
+let subRedis: ReturnType<typeof createRedis> | null = null;
 let shuttingDown = false;
 
-async function sendCallbackToQueue(id: string, payload: Record<string, any>) {
+// ------------------------------------------------------------ instrumentation
+
+const stats = { messages: 0, totalUs: 0, maxUs: 0 };
+
+function recordLatency(startNs: bigint) {
+  const us = Number(process.hrtime.bigint() - startNs) / 1000;
+  stats.messages++;
+  stats.totalUs += us;
+  if (us > stats.maxUs) stats.maxUs = us;
+}
+
+setInterval(() => {
+  if (stats.messages === 0) return;
+  console.log(
+    `[ENGINE] ${stats.messages} msgs/min | avg ${(stats.totalUs / stats.messages).toFixed(0)}µs | max ${stats.maxUs.toFixed(0)}µs | ${Object.keys(ORDER).length} open orders`
+  );
+  stats.messages = 0;
+  stats.totalUs = 0;
+  stats.maxUs = 0;
+}, 60_000).unref();
+
+// ------------------------------------------------------------------ callbacks
+
+async function sendCallback(id: string, payload: Record<string, unknown>) {
   const flat: string[] = ["id", id];
   for (const [k, v] of Object.entries(payload)) {
-    flat.push(k, v == null ? "" : String(v));
+    if (v === undefined || v === null) continue;
+    flat.push(k, typeof v === "object" ? JSON.stringify(v) : String(v));
   }
   try {
-    await redis.xadd("callback-queue", "*", ...flat);
-    console.log(`[ENGINE] Callback -> ${id}`, payload);
+    await redis.xadd(STREAMS.CALLBACKS, "MAXLEN", "~", 10_000, "*", ...flat);
   } catch (err) {
     console.error(`[ENGINE] Failed to push callback for ${id}`, err);
   }
 }
 
-/**
- * Handle stream message logic
- */
-async function handleStreamMessage(raw: Record<string, string>) {
+// ------------------------------------------------------------------- handlers
+
+async function handleCommand(msg: EngineCommand, replay: boolean) {
+  const { id, request } = msg;
+
   try {
-    if (!raw.data) return;
-    const msg = JSON.parse(raw.data);
+    switch (request.kind) {
+      case "place-trade": {
+        const result = await openOrder(request.payload, { replay });
 
-    // ----------------- PRICE UPDATE -----------------
-    if (msg.kind === "price-update") {
-      const { symbol, askPrice, bidPrice } = msg.payload;
-      if (!symbol) return;
+        if (!result.ok) {
+          await sendCallback(id, { status: "error", msg: result.error });
+          return;
+        }
 
-      PRICESTORE[symbol] = { ask: Number(askPrice), bid: Number(bidPrice) };
-      await checkOpenOrders(symbol, PRICESTORE[symbol]);
-      return;
-    }
-
-    // ----------------- PLACE TRADE -----------------
-    if (msg.request && msg.id && msg.request.kind === "place-trade") {
-      const id: string = msg.id;
-      const data = msg.request.payload;
-      const { userId, asset, type, margin, leverage, takeProfit, stopLoss } =
-        data;
-
-      const priceData = PRICESTORE[asset];
-      if (!priceData) {
-        await sendCallbackToQueue(id, {
-          status: "error",
-          msg: "no-price-available",
+        await sendCallback(id, {
+          status: "opened",
+          asset: request.payload.asset,
+          side: request.payload.type,
+          openPrice: result.openPrice,
+          takeProfit: request.payload.takeProfit,
+          stopLoss: request.payload.stopLoss,
+          liquidation: result.liquidation,
+          leverage: request.payload.leverage,
+          margin: result.margin,
+          volume: request.payload.volume,
         });
         return;
       }
 
-      const openPrice = type === "buy" ? priceData.ask : priceData.bid;
+      case "close-trade": {
+        const { orderId, userId, volume } = request.payload;
 
-      ORDER[id] = {
-        userId,
-        type,
-        asset,
-        margin,
-        leverage,
-        openPrice,
-        timestamp: Date.now(),
-        takeProfit,
-        stopLoss,
-      };
+        const order = ORDER[orderId];
+        // ownership check: a foreign orderId is indistinguishable from a
+        // missing one on purpose (no order-existence oracle)
+        if (!order || order.userId !== userId) {
+          await sendCallback(id, { status: "error", msg: "order-not-found" });
+          return;
+        }
 
-      console.log(`[ENGINE] Order opened ${id} on ${asset} @ ${openPrice}`);
+        const priceData = PRICESTORE[order.asset];
+        if (!priceData) {
+          await sendCallback(id, { status: "error", msg: "no-price-available" });
+          return;
+        }
 
-      await sendCallbackToQueue(id, {
-        status: "opened",
-        asset,
-        side: type,
-        openPrice,
-        takeProfit,
-        stopLoss,
-        liquidation: "false",
-        leverage,
-        margin,
-      });
-      return;
-    }
+        const price = order.type === "buy" ? priceData.bid : priceData.ask;
 
-    // ----------------- CLOSE TRADE -----------------
-    if (msg.request && msg.id && msg.request.kind === "close-trade") {
-      const id: string = msg.id;
-      const data = msg.request.payload;
-      const { orderId, userId } = data;
+        // partial close: anything below the order's volume; a leftover
+        // smaller than 0.01 lot would be unclosable dust, so full-close then
+        const isPartial = volume !== undefined && volume < order.volume && order.volume - volume >= 1;
 
-      const order = ORDER[orderId];
-      if (!order) {
-        await sendCallbackToQueue(id, {
-          status: "error",
-          msg: "order-not-found",
+        const pnl = isPartial
+          ? await partialCloseOrder(id, orderId, volume, price)
+          : await closeOrder(orderId, "manual", price);
+
+        await sendCallback(id, {
+          status: "closed",
+          asset: order.asset,
+          side: order.type,
+          closePrice: price,
+          pnl: pnl ?? 0,
+          partial: isPartial,
+          remainingVolume: isPartial ? order.volume : 0,
         });
         return;
       }
 
-      const priceData = PRICESTORE[order.asset];
-      if (!priceData) {
-        await sendCallbackToQueue(id, {
-          status: "error",
-          msg: "no-price-available",
+      case "modify-trade": {
+        const result = await modifyOrder(request.payload);
+        if (!result.ok) {
+          await sendCallback(id, { status: "error", msg: result.error });
+          return;
+        }
+        await sendCallback(id, {
+          status: "modified",
+          takeProfit: result.takeProfit,
+          stopLoss: result.stopLoss,
         });
         return;
       }
 
-      const price = order.type === "buy" ? priceData.bid : priceData.ask;
+      case "get-open-orders": {
+        const { userId } = request.payload;
+        const orders = Object.entries(ORDER)
+          .filter(([, o]) => o.userId === userId)
+          .map(([orderId, o]) => ({
+            orderId,
+            asset: o.asset,
+            type: o.type,
+            margin: o.margin,
+            volume: o.volume,
+            leverage: o.leverage,
+            openPrice: o.openPrice,
+            takeProfit: o.takeProfit,
+            stopLoss: o.stopLoss,
+            liquidation: o.liquidation,
+            timestamp: o.timestamp,
+          }));
 
-      // Explicit cast: ensure we match your CloseOrderReason type
-      const reason: CloseOrderReason = "manual" as CloseOrderReason;
-
-      const pnl = await closeOrder(userId, orderId, reason, price);
-
-      await sendCallbackToQueue(id, {
-        status: "closed",
-        asset: order.asset,
-        side: order.type,
-        closePrice: price,
-        pnl,
-      });
-
-      console.log(`[ENGINE] Closed order ${orderId} manually by user`);
-      return;
+        await sendCallback(id, { status: "ok", orders: JSON.stringify(orders) });
+        return;
+      }
     }
   } catch (err) {
-    console.error("[ENGINE] Failed to process message:", err);
+    console.error(`[ENGINE] Failed to process command ${id}:`, err);
+    await sendCallback(id, { status: "error", msg: "engine-error" });
   }
 }
 
-/**
- * Restore the latest engine snapshot from DB
- */
-export async function restoreSnapshot(): Promise<string | null> {
+async function handleStreamMessage(raw: Record<string, string>, replay: boolean) {
+  if (!raw.data) return;
+
+  let parsedJson: unknown;
   try {
-    const latest = await prismaClient.engineSnapshot.findFirst({
-      orderBy: { timestamp: "desc" },
-    });
+    parsedJson = JSON.parse(raw.data);
+  } catch {
+    console.error("[ENGINE] Dropping non-JSON stream message");
+    return;
+  }
 
-    if (!latest) {
-      console.log("[SNAPSHOT] No snapshot found, starting fresh.");
-      return null;
-    }
+  // validate at the boundary — a malformed producer can never half-execute
+  const parsed = engineStreamMessageSchema.safeParse(parsedJson);
+  if (!parsed.success) {
+    console.error("[ENGINE] Dropping malformed stream message:", parsed.error.issues[0]?.message);
+    return;
+  }
+  const msg = parsed.data;
 
-    Object.assign(ORDER, latest.openOrders || {});
-    Object.assign(PRICESTORE, latest.priceStore || {});
+  if ("kind" in msg) {
+    // price update
+    const { symbol, askPrice, bidPrice } = msg.payload;
+    PRICESTORE[symbol] = { ask: askPrice, bid: bidPrice, updatedAt: Date.now() };
+    await checkOpenOrders(symbol, PRICESTORE[symbol]);
+    return;
+  }
 
-    console.log(`[SNAPSHOT] Restored snapshot from ${latest.timestamp}`);
-    return latest.lastStreamId || null;
-  } catch (err) {
-    console.error("[SNAPSHOT] Failed to restore snapshot:", err);
-    return null;
+  await handleCommand(msg, replay);
+}
+
+// ---------------------------------------------------------------- stream loop
+
+async function streamTip(client: ReturnType<typeof createRedis>): Promise<string> {
+  try {
+    const latest = await client.xrevrange(STREAMS.ENGINE, "+", "-", "COUNT", 1);
+    return latest.length ? latest[0]![0] : "0-0";
+  } catch {
+    return "0-0";
   }
 }
 
-/**
- * Stream reader loop
- */
-async function startEngineStream(initialId = "$") {
-  console.log("[ENGINE] Listening on engine-stream...");
-
-  subRedis = redis.duplicate();
-  if (subRedis.status === "end" || subRedis.status === "wait") {
-    await subRedis.connect();
-  }
-
+async function startEngineStream(initialId: string) {
+  subRedis = createRedis();
   let lastId = initialId;
+
+  // resolve "$" to the concrete tip so nothing slips between blocking reads
+  if (lastId === "$") lastId = await streamTip(subRedis);
+
+  // everything at-or-before the tip existing at boot is a replay of messages
+  // we may have already (partially) executed before a crash
+  const replayBoundary = await streamTip(subRedis);
+
+  console.log(
+    `[ENGINE] Listening on ${STREAMS.ENGINE} from ${lastId} (replay boundary ${replayBoundary})...`
+  );
 
   try {
     while (!shuttingDown) {
-      const res = await subRedis.xread(
-        "BLOCK",
-        0,
-        "STREAMS",
-        "engine-stream",
-        lastId
-      );
+      const res = await subRedis.xread("BLOCK", 5000, "STREAMS", STREAMS.ENGINE, lastId);
 
       if (!res || !Array.isArray(res) || res.length === 0) continue;
-      const [streamName, messages] = res[0];
+      const [, messages] = res[0]!;
       if (!messages || messages.length === 0) continue;
 
       for (const [id, rawFields] of messages) {
-        CURRENT_STREAM_ID = id;  // track for snapshot
-        lastId = id;             // ✅ advance so we don’t replay same message
-
         const obj: Record<string, string> = {};
         for (let i = 0; i < rawFields.length; i += 2) {
-          obj[rawFields[i]] = rawFields[i + 1];
+          obj[rawFields[i]!] = rawFields[i + 1]!;
         }
 
-        await handleStreamMessage(obj);
+        const startNs = process.hrtime.bigint();
+        const replay = compareStreamIds(id, replayBoundary) <= 0;
+        await handleStreamMessage(obj, replay);
+        recordLatency(startNs);
+
+        // advance the cursor only after the message is fully processed, so a
+        // crash mid-message replays it (all handlers are idempotent)
+        CURRENT_STREAM_ID = id;
+        lastId = id;
       }
     }
   } catch (err) {
-    if (!shuttingDown) console.error("[ENGINE] Stream read error:", err);
+    if (!shuttingDown) {
+      console.error("[ENGINE] Stream read error, restarting loop in 1s:", err);
+      setTimeout(() => startEngineStream(lastId), 1000);
+      return;
+    }
   } finally {
-    console.log("[ENGINE] Stream loop exited.");
-    await subRedis.disconnect();
+    if (shuttingDown) {
+      console.log("[ENGINE] Stream loop exited.");
+      subRedis?.disconnect();
+    }
   }
 }
 
+// ------------------------------------------------------------------- lifecycle
 
-/**
- * Graceful shutdown
- */
 async function shutdown() {
-  if (shuttingDown) return;  //prevent multiple calls
+  if (shuttingDown) return;
   shuttingDown = true;
   console.log("[ENGINE] Shutting down...");
   try {
     await saveSnapshot(CURRENT_STREAM_ID);
-    if (subRedis) await subRedis.disconnect(); //instant break BLOCK
+    subRedis?.disconnect();
     await redis.quit();
-    console.log("[ENGINE] Redis connections closed and snapshot saved.");
+    console.log("[ENGINE] Snapshot saved, Redis closed.");
   } catch (err) {
     console.error("[ENGINE] Error during shutdown:", err);
   } finally {
@@ -233,45 +282,40 @@ async function shutdown() {
 process.on("SIGINT", shutdown);
 process.on("SIGTERM", shutdown);
 
-/**
- * Boot
- */
 async function main() {
   console.log("[ENGINE] Booting up...");
+  console.log(`[ENGINE] Command TTL ${COMMAND_TTL_MS}ms; single-writer event loop`);
 
-  if (redis.status === "end" || redis.status === "wait") {
-    await redis.connect();
-  }
-  console.log("[ENGINE] Connected to Redis!");
+  const restoredStreamId = await restoreState();
+  let lastId = restoredStreamId ?? "$";
 
-  // 🔄 Restore state
-  const restoredStreamId = await restoreSnapshot();
-  let lastId = "$";
-
-  if (restoredStreamId && restoredStreamId !== "$") {
-    const [ms, seq] = restoredStreamId.split("-");
-    const nextSeq = Number(seq || 0) + 1;
-    lastId = `${ms}-${nextSeq}`;
-  }
-
-  // sanity check
   if (!/^\d+-\d+$/.test(lastId) && lastId !== "$") {
     console.warn(`[ENGINE] Invalid lastId '${lastId}', resetting to "$"`);
     lastId = "$";
   }
 
-  console.log(`[ENGINE] Starting from stream ID: ${lastId}`);
-
   startEngineStream(lastId);
 
-  // 🕒 Schedule snapshots every minute
+  // snapshot the stream cursor every 30s; trim the stream every 5min
   let isSavingSnapshot = false;
   setInterval(async () => {
     if (isSavingSnapshot) return;
     isSavingSnapshot = true;
-    await saveSnapshot(CURRENT_STREAM_ID);
-    isSavingSnapshot = false;
-  }, 60_000);
+    try {
+      await saveSnapshot(CURRENT_STREAM_ID);
+    } finally {
+      isSavingSnapshot = false;
+    }
+  }, 30_000);
+
+  setInterval(() => {
+    redis
+      .xtrim(STREAMS.ENGINE, "MAXLEN", "~", STREAM_MAXLEN)
+      .catch((err) => console.error("[ENGINE] xtrim failed:", err));
+  }, 300_000);
 }
 
-main().catch((err) => console.error("[ENGINE] Failed to start:", err));
+main().catch((err) => {
+  console.error("[ENGINE] Failed to start:", err);
+  process.exit(1);
+});
