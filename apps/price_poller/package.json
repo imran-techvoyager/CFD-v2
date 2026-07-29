@@ -1,16 +1,21 @@
 {
   "name": "price_poller",
-  "module": "index.ts",
+  "module": "src/index.ts",
   "type": "module",
   "private": true,
-  "devDependencies": {
-    "@types/bun": "latest"
+  "scripts": {
+    "dev": "node --env-file=../../.env --import tsx --watch src/index.ts",
+    "start": "node --env-file=../../.env --import tsx src/index.ts",
+    "check-types": "tsc --noEmit"
   },
-  "peerDependencies": {
-    "typescript": "^5"
+  "devDependencies": {
+    "@types/node": "^22.15.3",
+    "tsx": "^4.19.2",
+    "typescript": "5.9.2"
   },
   "dependencies": {
     "@repo/redis": "workspace:*",
+    "@repo/shared": "workspace:*",
     "@types/ws": "^8.18.1",
     "ws": "^8.18.3"
   }
