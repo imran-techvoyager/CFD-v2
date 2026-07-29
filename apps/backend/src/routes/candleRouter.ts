@@ -1,7 +1,7 @@
 import { Router } from "express";
-import { authMiddleware } from "../middleware/authMiddleware";
 import { getCandles } from "../controller/candleController";
 
 export const candleRouter = Router();
 
-candleRouter.route('/').post(authMiddleware, getCandles);
+// public market data — the chart needs it before/without auth
+candleRouter.route("/").get(getCandles);

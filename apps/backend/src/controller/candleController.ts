@@ -1,117 +1,67 @@
 import { type Request, type Response } from "express";
 
+// Candles come from the same venue as the live price feed (Binance),
+// so the chart matches what the engine trades on.
+const SYMBOL_MAP: Record<string, string> = {
+  BTC: "BTCUSDT",
+  ETH: "ETHUSDT",
+  SOL: "SOLUSDT",
+};
+
+const VALID_INTERVALS = new Set([
+  "1m", "3m", "5m", "15m", "30m",
+  "1h", "2h", "4h", "6h", "8h", "12h",
+  "1d", "3d", "1w", "1M",
+]);
+
 export const getCandles = async (req: Request, res: Response) => {
   try {
-    const { ts: timeframe, startTime, endTime, asset } = req.query;
+    const asset = String(req.query.asset || "").toUpperCase();
+    const interval = String(req.query.ts || "1m");
+    const limit = Math.min(Number(req.query.limit) || 500, 1000);
+    const endTime = req.query.endTime ? Number(req.query.endTime) : undefined;
 
-    if (!timeframe || !startTime || !asset) {
-      return res.status(400).json({
-        error: "Missing required parameters: timeframe, startTime, asset",
-      });
+    const symbol = SYMBOL_MAP[asset];
+    if (!symbol) {
+      return res.status(400).json({ error: "invalid asset (BTC|ETH|SOL)" });
+    }
+    if (!VALID_INTERVALS.has(interval)) {
+      return res.status(400).json({ error: "invalid interval" });
     }
 
-    let symbol = (asset as string).toUpperCase();
-    if (symbol === "BTCUSDT" || symbol === "BTCUSDC") {
-      symbol = "BTC_USDC";
-    } else if (symbol === "ETHUSDT" || symbol === "ETHUSDC") {
-      symbol = "ETH_USDC";
-    } else if (symbol === "SOLUSDT" || symbol === "SOLUSDC") {
-      symbol = "SOL_USDC";
+    let url = `https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`;
+    if (endTime && Number.isFinite(endTime)) {
+      url += `&endTime=${endTime}`;
     }
 
-    const nowInSeconds = Math.floor(Date.now() / 1000);
-
-    let timeRangeInSeconds;
-    switch (timeframe) {
-      case "1m":
-        timeRangeInSeconds = 24 * 60 * 60;
-        break;
-      case "3m":
-        timeRangeInSeconds = 2 * 24 * 60 * 60;
-        break;
-      case "5m":
-        timeRangeInSeconds = 3 * 24 * 60 * 60;
-        break;
-      case "15m":
-        timeRangeInSeconds = 7 * 24 * 60 * 60;
-        break;
-      case "30m":
-        timeRangeInSeconds = 14 * 24 * 60 * 60;
-        break;
-      case "1h":
-        timeRangeInSeconds = 30 * 24 * 60 * 60;
-        break;
-      case "2h":
-        timeRangeInSeconds = 45 * 24 * 60 * 60;
-        break;
-      case "4h":
-        timeRangeInSeconds = 60 * 24 * 60 * 60;
-        break;
-      case "6h":
-        timeRangeInSeconds = 90 * 24 * 60 * 60;
-        break;
-      case "8h":
-        timeRangeInSeconds = 120 * 24 * 60 * 60;
-        break;
-      case "12h":
-        timeRangeInSeconds = 180 * 24 * 60 * 60;
-        break;
-      case "1d":
-        timeRangeInSeconds = 365 * 24 * 60 * 60;
-        break;
-      case "3d":
-        timeRangeInSeconds = 3 * 365 * 24 * 60 * 60;
-        break;
-      case "1w":
-        timeRangeInSeconds = 2 * 365 * 24 * 60 * 60;
-        break;
-      case "1M":
-        timeRangeInSeconds = 5 * 365 * 24 * 60 * 60;
-        break;
-      default:
-        timeRangeInSeconds = 7 * 24 * 60 * 60;
-    }
-
-    const actualStartTime = nowInSeconds - timeRangeInSeconds;
-    const actualEndTime = nowInSeconds;
-
-    const backpackUrl = `https://api.backpack.exchange/api/v1/klines?symbol=${symbol}&interval=${timeframe}&startTime=${actualStartTime}&endTime=${actualEndTime}`;
-
-    const response = await fetch(backpackUrl);
-
+    const response = await fetch(url);
     if (!response.ok) {
       const errorText = await response.text();
-      console.error(
-        `Backpack API error: ${response.status} ${response.statusText}`,
-        errorText
-      );
-      throw new Error(
-        `Backpack API error: ${response.status} ${response.statusText}`
-      );
+      console.error(`Binance API error: ${response.status}`, errorText);
+      return res
+        .status(502)
+        .json({ error: `upstream error: ${response.status}` });
     }
 
-    const data = await response.json();
-
+    const data = (await response.json()) as any[];
     if (!Array.isArray(data)) {
-      throw new Error("Unexpected response format: data is not an array");
+      return res.status(502).json({ error: "unexpected upstream format" });
     }
 
-    const transformedData = data.map((candle: any) => ({
-      bucket: candle.start,
-      symbol: asset,
-      open: parseFloat(candle.open),
-      high: parseFloat(candle.high),
-      low: parseFloat(candle.low),
-      close: parseFloat(candle.close),
-      volume: parseFloat(candle.volume),
-      time: candle.start,
+    const candles = data.map((k) => ({
+      time: Math.floor(k[0] / 1000), // open time, seconds
+      open: parseFloat(k[1]),
+      high: parseFloat(k[2]),
+      low: parseFloat(k[3]),
+      close: parseFloat(k[4]),
+      volume: parseFloat(k[5]),
     }));
 
-    res.json({ data: transformedData });
+    res.json({ data: candles });
   } catch (error) {
     console.error("Error fetching candles:", error);
     res.status(500).json({
-      error: "Failed to fetch candles from Backpack API",
+      error: "Failed to fetch candles",
       details: error instanceof Error ? error.message : "Unknown error",
     });
   }
