@@ -1,0 +1,37 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: cfd_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: cfd
+      POSTGRES_PASSWORD: cfd_secret
+      POSTGRES_DB: cfd
+    ports:
+      - "5433:5432"
+    volumes:
+      - cfd_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U cfd -d cfd"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    container_name: cfd_redis
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "6379:6379"
+    volumes:
+      - cfd_redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  cfd_pgdata:
+  cfd_redisdata:
