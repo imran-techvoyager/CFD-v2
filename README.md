@@ -1,135 +1,93 @@
-# Turborepo starter
+# CFD-v2 — Paper-Money CFD Trading Platform
 
-This Turborepo starter is maintained by the Turborepo core team.
+An Exness-style CFD trading platform. Every new account gets **$5,000 paper money** and can trade **BTC, ETH and SOL** against live crypto markets in **lots** with dynamic leverage (1:1–1:400), take-profit, stop-loss, position modify, partial close and automatic liquidation — with draggable TP/SL lines right on the chart.
 
-## Using this example
+## Architecture
 
-Run the following command:
+```
+Binance WS ──> price_poller ──┬──> Redis pub/sub ──> websocket_server ──> browser (live prices, order events)
+                              └──> Redis stream "engine-stream" ──> engine (single-threaded matching/risk)
+browser ──> web (Next.js :3000) ──> backend (Express :4000) ──> engine-stream ──> engine
+                                             ^                                      │
+                                             └───── "callback-queue" stream ────────┘
+engine ──> Postgres (OpenOrders / ClosedOrders / balances / snapshots)
+```
+
+| App | Port | Role |
+|---|---|---|
+| `apps/web` | 3000 | Next.js trading terminal (chart, watchlist, order panel, positions) |
+| `apps/backend` | 4000 | REST API: auth, trades, candles (Binance klines proxy) |
+| `apps/websocket_server` | 8080 | Fans out live prices + per-user order events (JWT auth) |
+| `apps/price_poller` | — | Binance aggTrade → internal bid/ask ticks (5 bps spread, 100ms throttle) |
+| `apps/engine` | — | Consumes engine-stream; opens/closes/liquidates positions |
+
+### Units (internal)
+- **Prices**: integers scaled by `1e4` (e.g. $61,428.5033 → `614285033`)
+- **Money** (balance, margin, pnl): integer **cents**
+- The REST API speaks decimal USD; the backend converts at the boundary.
+
+### Crash recovery / exactly-once
+- Opening a trade atomically (one DB transaction) deducts margin **and** inserts an `OpenOrders` row keyed by a unique `orderId`. Closing atomically inserts `ClosedOrders`, deletes the `OpenOrders` row and credits margin+pnl.
+- The engine snapshots its stream cursor every 30s. On restart it reloads open orders from the DB and replays the stream from the cursor — replayed commands are no-ops thanks to the unique `orderId` constraints, so balances can never double-deduct/credit.
+- PnL is clamped at `-margin` (gap protection); liquidation price = entry × (1 ∓ 1/leverage).
+
+## Running locally
+
+Requirements: Node 20+ (uses `--env-file`), pnpm, Docker.
 
 ```sh
-npx create-turbo@latest
+# 1. infra (Postgres :5433, Redis :6379)
+docker compose up -d
+
+# 2. deps + env
+pnpm install
+cp .env.example .env    # already has working local defaults
+
+# 3. database
+cd packages/db && pnpm db:deploy && pnpm db:generate && cd ../..
+
+# 4. everything (turbo runs all dev scripts)
+pnpm dev
 ```
 
-## What's inside?
+Or start services individually with `pnpm start` inside each `apps/*` directory.
 
-This Turborepo includes the following packages/apps:
+Open http://localhost:3000, sign up, and trade.
 
-### Apps and Packages
-
-- `docs`: a [Next.js](https://nextjs.org/) app
-- `web`: another [Next.js](https://nextjs.org/) app
-- `@repo/ui`: a stub React component library shared by both `web` and `docs` applications
-- `@repo/eslint-config`: `eslint` configurations (includes `eslint-config-next` and `eslint-config-prettier`)
-- `@repo/typescript-config`: `tsconfig.json`s used throughout the monorepo
-
-Each package/app is 100% [TypeScript](https://www.typescriptlang.org/).
-
-### Utilities
-
-This Turborepo has some additional tools already setup for you:
-
-- [TypeScript](https://www.typescriptlang.org/) for static type checking
-- [ESLint](https://eslint.org/) for code linting
-- [Prettier](https://prettier.io) for code formatting
-
-### Build
-
-To build all apps and packages, run the following command:
+## API quick reference
 
 ```
-cd my-turborepo
-
-# With [global `turbo`](https://turborepo.com/docs/getting-started/installation#global-installation) installed (recommended)
-turbo build
-
-# Without [global `turbo`](https://turborepo.com/docs/getting-started/installation#global-installation), use your package manager
-npx turbo build
-yarn dlx turbo build
-pnpm exec turbo build
+POST /api/v1/auth/signup   {email, password}            → token + $5,000 account
+POST /api/v1/auth/signin   {email, password}            → token
+GET  /api/v1/auth/me                                    → {email, balance}
+POST /api/v1/trade         {asset, type, volume (lots), leverage, takeprofit?, stoploss?}
+POST /api/v1/trade/close   {orderId, volume?}        # volume < position = partial close
+POST /api/v1/trade/modify  {orderId, takeprofit?|null, stoploss?|null}
+GET  /api/v1/trade/open                                 → live positions
+GET  /api/v1/trade                                      → closed trade history
+GET  /api/v1/candles?asset=BTC&ts=1m&limit=500          → OHLCV (Binance)
 ```
 
-You can build a specific package by using a [filter](https://turborepo.com/docs/crafting-your-repository/running-tasks#using-filters):
+All prices in decimal USD. `asset ∈ {BTC, ETH, SOL}`, `leverage ∈ {1,5,10,20,50,100,200,400}`.
 
-```
-# With [global `turbo`](https://turborepo.com/docs/getting-started/installation#global-installation) installed (recommended)
-turbo build --filter=docs
+## Engineering notes
 
-# Without [global `turbo`](https://turborepo.com/docs/getting-started/installation#global-installation), use your package manager
-npx turbo build --filter=docs
-yarn exec turbo build --filter=docs
-pnpm exec turbo build --filter=docs
-```
+- **Single-writer engine**: one event loop owns all mutable state (LMAX-style) — no locks, no races by construction. Measured handling latency ≈ **85µs avg / <200µs max** per message.
+- **Typed wire contracts**: every cross-process message (`@repo/shared`) is a zod schema shared by producer and consumer; consumers validate at the boundary, so a malformed producer can never half-execute.
+- **Hot-path indexing**: orders are indexed per symbol, so a tick only visits orders on that symbol.
+- **Command TTL**: commands older than 15s are refused — a request whose HTTP caller already timed out can't open exposure late.
+- **Stale-price guard**: opens are refused if the newest tick is >10s old (feed outage); closes stay allowed.
+- **Race-safe ledger**: margin is deducted with a conditional `UPDATE … WHERE balance >= margin` inside the same transaction that creates the order row — proven by the e2e concurrency test (10 parallel orders, never a cent over-deducted).
+- **Rate limiting** on credential endpoints; graceful drain on SIGTERM everywhere.
 
-### Develop
+## Testing
 
-To develop all apps and packages, run the following command:
-
-```
-cd my-turborepo
-
-# With [global `turbo`](https://turborepo.com/docs/getting-started/installation#global-installation) installed (recommended)
-turbo dev
-
-# Without [global `turbo`](https://turborepo.com/docs/getting-started/installation#global-installation), use your package manager
-npx turbo dev
-yarn exec turbo dev
-pnpm exec turbo dev
+```sh
+pnpm e2e   # requires the full stack running
 ```
 
-You can develop a specific package by using a [filter](https://turborepo.com/docs/crafting-your-repository/running-tasks#using-filters):
-
-```
-# With [global `turbo`](https://turborepo.com/docs/getting-started/installation#global-installation) installed (recommended)
-turbo dev --filter=web
-
-# Without [global `turbo`](https://turborepo.com/docs/getting-started/installation#global-installation), use your package manager
-npx turbo dev --filter=web
-yarn exec turbo dev --filter=web
-pnpm exec turbo dev --filter=web
-```
-
-### Remote Caching
-
-> [!TIP]
-> Vercel Remote Cache is free for all plans. Get started today at [vercel.com](https://vercel.com/signup?/signup?utm_source=remote-cache-sdk&utm_campaign=free_remote_cache).
-
-Turborepo can use a technique known as [Remote Caching](https://turborepo.com/docs/core-concepts/remote-caching) to share cache artifacts across machines, enabling you to share build caches with your team and CI/CD pipelines.
-
-By default, Turborepo will cache locally. To enable Remote Caching you will need an account with Vercel. If you don't have an account you can [create one](https://vercel.com/signup?utm_source=turborepo-examples), then enter the following commands:
-
-```
-cd my-turborepo
-
-# With [global `turbo`](https://turborepo.com/docs/getting-started/installation#global-installation) installed (recommended)
-turbo login
-
-# Without [global `turbo`](https://turborepo.com/docs/getting-started/installation#global-installation), use your package manager
-npx turbo login
-yarn exec turbo login
-pnpm exec turbo login
-```
-
-This will authenticate the Turborepo CLI with your [Vercel account](https://vercel.com/docs/concepts/personal-accounts/overview).
-
-Next, you can link your Turborepo to your Remote Cache by running the following command from the root of your Turborepo:
-
-```
-# With [global `turbo`](https://turborepo.com/docs/getting-started/installation#global-installation) installed (recommended)
-turbo link
-
-# Without [global `turbo`](https://turborepo.com/docs/getting-started/installation#global-installation), use your package manager
-npx turbo link
-yarn exec turbo link
-pnpm exec turbo link
-```
-
-## Useful Links
-
-Learn more about the power of Turborepo:
-
-- [Tasks](https://turborepo.com/docs/crafting-your-repository/running-tasks)
-- [Caching](https://turborepo.com/docs/crafting-your-repository/caching)
-- [Remote Caching](https://turborepo.com/docs/core-concepts/remote-caching)
-- [Filtering](https://turborepo.com/docs/crafting-your-repository/running-tasks#using-filters)
-- [Configuration Options](https://turborepo.com/docs/reference/configuration)
-- [CLI Usage](https://turborepo.com/docs/reference/command-line-reference)
+58 assertions: auth, validation, full trade lifecycle with exact balance math,
+position modify + partial close (exact ledger), parallel-placement races, cross-user security, TP/SL/liquidation via synthetic
+ticks (including gap-through-liquidation pnl clamping), malformed-message
+resilience, expired-command refusal, and rate limiting. Crash recovery is
+verified by `kill -9`-ing the engine with open positions and restarting.
