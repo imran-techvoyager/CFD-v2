@@ -2,47 +2,44 @@ import { type Request, type Response } from "express";
 import { redis } from "@repo/redis/client";
 import { v4 as uuidv4 } from "uuid";
 import prismaClient from "@repo/db/client";
-import { tradeSchema } from "../types/types";
-// import { waitForMessage } from "../utils";
+import { closeTradeSchema, modifyTradeSchema, tradeSchema } from "../types/types";
 import { RedisSubscriber } from "../utils/redisSubscriber";
+import {
+  STREAMS,
+  VOLUME_SCALE,
+  fromInternalPrice,
+  fromInternalUsd,
+  toInternalPrice,
+  type EngineRequest,
+} from "@repo/shared";
 
 const subscriber = new RedisSubscriber();
 
-const addToStream = async (id: string, request: any) => {
-  console.log(
-    `[CONTROLLER] Adding order ${id} to engine-stream:`,
-    JSON.stringify(request, null, 2)
-  );
+const addToStream = async (id: string, request: EngineRequest) => {
   await redis.xadd(
-    "engine-stream",
+    STREAMS.ENGINE,
     "*",
     "data",
-    JSON.stringify({
-      id,
-      request,
-    })
+    JSON.stringify({ id, request })
   );
-  console.log(`[CONTROLLER] Successfully added order ${id} to engine-stream`);
 };
 
-export async function sendRequestAndWait(id: string, request: any) {
-  console.log(`[CONTROLLER] Starting sendRequestAndWait for order ${id}`);
+export async function sendRequestAndWait(id: string, request: EngineRequest) {
+  const [, response] = await Promise.all([
+    addToStream(id, request),
+    subscriber.waitForMessage(id),
+  ]);
+  return response;
+}
 
-  try {
-    const [_, response] = await Promise.all([
-      addToStream(id, request),
-      subscriber.waitForMessage(id),
-    ]);
-
-    console.log(`[CONTROLLER] Both promises resolved for order ${id}`);
-    return response;
-  } catch (error) {
-    console.error(
-      `[CONTROLLER] Error in sendRequestAndWait for order ${id}:`,
-      error
-    );
-    throw error;
+function engineTimeout(res: Response, error: any) {
+  if (String(error?.message || "").startsWith("Timeout")) {
+    res
+      .status(504)
+      .json({ msg: "engine did not respond, please refresh your orders" });
+    return true;
   }
+  return false;
 }
 
 export async function placeTrade(req: Request, res: Response) {
@@ -53,58 +50,61 @@ export async function placeTrade(req: Request, res: Response) {
       return res.status(400).json({ msg: "invalid input" });
     }
 
-    const { asset, type, margin, leverage, takeprofit, stoploss } = trade.data;
+    const { asset, type, volume, leverage, takeprofit, stoploss } = trade.data;
     const userId = req.userId;
 
     if (!userId) {
-      return res.status(400).json({ msg: "userId missing from request" });
-    }
-
-    const user = await prismaClient.user.findUnique({ where: { id: userId } });
-    if (!user) {
-      return res.status(400).json({ msg: "user does not exist" });
-    }
-
-    if (user.balance < margin) {
-      return res.status(400).json({ msg: "insufficient balance" });
+      return res.status(401).json({ msg: "user not authenticated" });
     }
 
     const orderId = uuidv4();
 
     const payload = {
-      kind: "place-trade",
+      kind: "place-trade" as const,
       payload: {
         orderId,
         userId,
         asset,
-        type: type, // Changed from 'side' to 'type' to match engine expectations
-        margin,
+        type,
+        volume: Math.round(volume * VOLUME_SCALE),
         leverage,
-        takeProfit: takeprofit,
-        stopLoss: stoploss,
+        takeProfit: takeprofit ? toInternalPrice(takeprofit) : undefined,
+        stopLoss: stoploss ? toInternalPrice(stoploss) : undefined,
         timestamp: Date.now(),
       },
     };
 
     const response = await sendRequestAndWait(orderId, payload);
 
-    // Now respond to the client with the order details
+    if (response.status !== "opened") {
+      return res.status(400).json({ msg: response.msg || "trade rejected" });
+    }
+
     return res.status(200).json({
       msg: "trade opened successfully",
       order: {
-        orderId: response.id,
-        asset: response.asset,
-        side: response.side,
+        orderId,
+        asset,
+        type,
         status: response.status,
-        openPrice: Number(response.openPrice),
-        takeProfit: Number(response.takeProfit),
-        stopLoss: Number(response.stopLoss),
-        liquidation: response.liquidation === "true",
-        leverage: Number(response.leverage),
-        margin: Number(response.margin),
+        volume,
+        openPrice: fromInternalPrice(Number(response.openPrice)),
+        margin: fromInternalUsd(Number(response.margin)),
+        takeProfit: response.takeProfit
+          ? fromInternalPrice(Number(response.takeProfit))
+          : null,
+        stopLoss: response.stopLoss
+          ? fromInternalPrice(Number(response.stopLoss))
+          : null,
+        liquidation:
+          Number(response.liquidation) > 0
+            ? fromInternalPrice(Number(response.liquidation))
+            : null,
+        leverage,
       },
     });
-  } catch (error) {
+  } catch (error: any) {
+    if (engineTimeout(res, error)) return;
     console.error("Error while creating trade:", error);
     return res.status(500).json({ msg: "internal server error" });
   }
@@ -112,107 +112,182 @@ export async function placeTrade(req: Request, res: Response) {
 
 export async function closeTrade(req: Request, res: Response) {
   try {
-    console.log("inside closeTrade route");
-
-    const { orderId } = req.body;
-    const userId = req.userId;
-
-    if (!userId) {
-      return res.status(400).json({ msg: "user not authenticated" });
-    }
-
-    if (!orderId) {
+    const parsed = closeTradeSchema.safeParse(req.body);
+    if (!parsed.success) {
       return res.status(400).json({ msg: "orderId is required" });
     }
 
+    const { orderId, volume } = parsed.data;
+    const userId = req.userId;
+
+    if (!userId) {
+      return res.status(401).json({ msg: "user not authenticated" });
+    }
+
+    const requestId = uuidv4();
     const payload = {
-      kind: "close-trade",
+      kind: "close-trade" as const,
       payload: {
         orderId,
         userId,
+        volume: volume ? Math.round(volume * VOLUME_SCALE) : undefined,
         timestamp: Date.now(),
       },
     };
 
-    //Send close-trade request to engine-stream
-    // await redis.xadd(
-    //   "engine-stream",
-    //   "*",
-    //   "kind",
-    //   "close-trade",
-    //   "payload",
-    //   JSON.stringify(payload)
-    // );
+    const response = await sendRequestAndWait(requestId, payload);
 
-    const response = await sendRequestAndWait(orderId, payload);
-
-    console.log("Sent close-trade event to engine-stream:", orderId);
+    if (response.status !== "closed") {
+      return res.status(400).json({ msg: response.msg || "close rejected" });
+    }
 
     return res.status(200).json({
-      msg: response.msg,
+      msg: "trade closed successfully",
       status: response.status,
       orderId,
+      partial: response.partial === "true",
+      remainingVolume: Number(response.remainingVolume || 0) / VOLUME_SCALE,
+      closePrice: fromInternalPrice(Number(response.closePrice)),
+      pnl: fromInternalUsd(Number(response.pnl)),
     });
-  } catch (error) {
+  } catch (error: any) {
+    if (engineTimeout(res, error)) return;
     console.error("Error while sending close order request:", error);
     return res.status(500).json({ msg: "internal server error" });
   }
 }
 
-// export async function getClosedTrades(req: Request, res: Response) {
-//   const userId = req.userId;
+export async function modifyTrade(req: Request, res: Response) {
+  try {
+    const parsed = modifyTradeSchema.safeParse(req.body);
+    if (!parsed.success) {
+      return res.status(400).json({ msg: "invalid input" });
+    }
 
-//   const today = new Date();
-//   today.setHours(0, 0, 0, 0);
-//   const tomorrow = new Date(today);
-//   tomorrow.setDate(today.getDate() + 1);
+    const { orderId, takeprofit, stoploss } = parsed.data;
+    const userId = req.userId;
 
-//   const todaysClosedOrder = await prismaClient.closedOrders.findMany({
-//     where: {
-//       userId,
-//       closeTimestamp: {
-//         gte: today,
-//         lt: tomorrow,
-//       },
-//     },
-//   });
+    if (!userId) {
+      return res.status(401).json({ msg: "user not authenticated" });
+    }
 
-//   res.status(200).json({
-//     trades: todaysClosedOrder,
-//   });
-// }
+    const requestId = uuidv4();
+    const payload = {
+      kind: "modify-trade" as const,
+      payload: {
+        orderId,
+        userId,
+        takeProfit:
+          takeprofit === undefined
+            ? undefined
+            : takeprofit === null
+              ? null
+              : toInternalPrice(takeprofit),
+        stopLoss:
+          stoploss === undefined
+            ? undefined
+            : stoploss === null
+              ? null
+              : toInternalPrice(stoploss),
+        timestamp: Date.now(),
+      },
+    };
 
-function normalizeBigInt(obj: any) {
-  return JSON.parse(
-    JSON.stringify(obj, (_, v) =>
-      typeof v === "bigint" ? Number(v) : v
-    )
-  );
+    const response = await sendRequestAndWait(requestId, payload);
+
+    if (response.status !== "modified") {
+      return res.status(400).json({ msg: response.msg || "modify rejected" });
+    }
+
+    return res.status(200).json({
+      msg: "position modified",
+      orderId,
+      takeProfit: response.takeProfit
+        ? fromInternalPrice(Number(response.takeProfit))
+        : null,
+      stopLoss: response.stopLoss
+        ? fromInternalPrice(Number(response.stopLoss))
+        : null,
+    });
+  } catch (error: any) {
+    if (engineTimeout(res, error)) return;
+    console.error("Error while modifying trade:", error);
+    return res.status(500).json({ msg: "internal server error" });
+  }
+}
+
+export async function getOpenTrades(req: Request, res: Response) {
+  try {
+    const userId = req.userId;
+    if (!userId) {
+      return res.status(401).json({ msg: "user not authenticated" });
+    }
+
+    const requestId = uuidv4();
+    const payload = {
+      kind: "get-open-orders" as const,
+      payload: { userId },
+    };
+
+    const response = await sendRequestAndWait(requestId, payload);
+    const raw = JSON.parse(response.orders || "[]") as any[];
+
+    const trades = raw.map((o) => ({
+      orderId: o.orderId,
+      asset: o.asset,
+      type: o.type,
+      volume: o.volume / VOLUME_SCALE,
+      margin: fromInternalUsd(o.margin),
+      leverage: o.leverage,
+      openPrice: fromInternalPrice(o.openPrice),
+      takeProfit: o.takeProfit ? fromInternalPrice(o.takeProfit) : null,
+      stopLoss: o.stopLoss ? fromInternalPrice(o.stopLoss) : null,
+      liquidation: o.liquidation > 0 ? fromInternalPrice(o.liquidation) : null,
+      timestamp: o.timestamp,
+    }));
+
+    return res.status(200).json({ trades });
+  } catch (error: any) {
+    if (engineTimeout(res, error)) return;
+    console.error("Error fetching open trades:", error);
+    return res.status(500).json({ msg: "internal server error" });
+  }
 }
 
 export async function getClosedTrades(req: Request, res: Response) {
   try {
     const userId = req.userId;
-
     if (!userId) {
-      return res.status(400).json({ msg: "user not authenticated" });
+      return res.status(401).json({ msg: "user not authenticated" });
     }
 
     const closedOrders = await prismaClient.closedOrders.findMany({
       where: { userId },
       orderBy: { closeTimestamp: "desc" },
+      take: 200,
     });
 
-    const safeTrades = normalizeBigInt(closedOrders);
+    const trades = closedOrders.map((o) => ({
+      orderId: o.orderId,
+      asset: o.asset,
+      type: o.type,
+      volume: o.volume / VOLUME_SCALE,
+      openPrice: fromInternalPrice(o.openPrice),
+      closePrice: fromInternalPrice(o.closePrice),
+      margin: fromInternalUsd(o.margin),
+      pnl: fromInternalUsd(o.pnl),
+      leverage: o.leverage,
+      closeReason: o.closeReason,
+      timestamp: o.timestamp,
+      closeTimestamp: o.closeTimestamp,
+    }));
 
     return res.status(200).json({
       msg: "fetched closed trades successfully",
-      trades: safeTrades,
+      trades,
     });
   } catch (error) {
     console.error("Error fetching closed trades:", error);
     return res.status(500).json({ msg: "internal server error" });
   }
 }
-
-
